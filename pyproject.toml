@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fshnista-entitlements"
-version = "1.0.0"
+version = "1.0.1"
 description = "Shared platform entitlement checks for FSHNiSTA microservices"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,5 +17,5 @@ dev = [
     "pytest>=8.0.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["fshnista_entitlements*"]
+[tool.setuptools]
+packages = ["fshnista_entitlements"]
