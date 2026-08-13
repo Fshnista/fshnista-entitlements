@@ -62,4 +62,4 @@ __all__ = [
 # Kept in step with pyproject.toml by hand. These two disagreed until
 # 1.1.0: this said 1.0.0 while the package built as 1.0.1, so anything
 # reading the version at runtime reported something that was never released.
-__version__ = "1.2.0"
+__version__ = "1.3.0"

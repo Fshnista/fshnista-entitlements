@@ -136,10 +136,12 @@ class _EntitlementCache:
 
 
 _cache = _EntitlementCache()
-# Keyed by "user_id:module", holds a bare Tier rather than a SubscriptionState:
-# a module tier is always derived (platform tier composed with a
-# merchant_subscriptions row), never a row read directly, so there is no
-# status or current_period_end of its own to carry.
+# Keyed by "user_id:module", holds a bool: whether an active
+# merchant_subscriptions row holds that module. A bool rather than a Tier
+# since v1.3.0, because the module row no longer decides the final answer
+# alone: a non-holding row falls through to the platform tier, which has its
+# own cache and its own freshness, and caching the composed Tier here would
+# let a stale composition outlive either ingredient.
 _module_cache = _EntitlementCache()
 
 
@@ -361,38 +363,43 @@ async def get_module_tier(
     since it takes no module and answers the same platform-wide tier
     regardless of which module is asking.
 
-    Nobody reaches Merchant without first holding Pro: Merchant is priced
-    and sold as the step above Pro's included allowance, not a replacement
-    for it (see entitlement_rules.py's per-module caps), so a lapsed
-    platform subscription reads as FREE here even against an
-    active-looking merchant_subscriptions row. Reconciling that row is
-    Stripe's and the webhook handler's job, not this read's.
+    **Paid time stays usable. Henry, 2026-08-13.** An active
+    merchant_subscriptions row grants MERCHANT on its module even when the
+    platform subscription has lapsed: money already taken must never buy
+    nothing, so a member who cancels Pro halfway through a paid Merchant
+    year keeps that one module working until the period they paid for runs
+    out. This deliberately replaces v1.2.0's rule, which read a lapsed
+    platform subscription as FREE against any merchant row. The ladder is
+    enforced where money changes hands instead: buying Merchant requires
+    Pro at the checkout endpoint, and the Stripe webhook stops Merchant
+    renewals the moment Pro is cancelled, so Merchant-without-Pro is only
+    ever a paid period running out, never a state anybody buys into or
+    renews inside. The truthfulness of the row's status is therefore the
+    webhook's responsibility; this read believes it.
 
     **Requires the caller's own connection to be Supabase.** Same
     requirement as get_subscription_state: a service whose database is
     somewhere else wants get_module_tier_via_rest instead.
     """
-    platform_tier = await get_user_tier(user_id, db)
-    if platform_tier != Tier.PRO:
-        return platform_tier
-
     cache_key = _module_cache_key(user_id, module)
-    cached = _module_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    merchant_hold = _module_cache.get(cache_key)
 
-    row = await db.fetchrow(
-        """
-        SELECT status FROM merchant_subscriptions
-        WHERE user_id = $1 AND module = $2
-        """,
-        user_id,
-        module.value,
-    )
+    if merchant_hold is None:
+        row = await db.fetchrow(
+            """
+            SELECT status FROM merchant_subscriptions
+            WHERE user_id = $1 AND module = $2
+            """,
+            user_id,
+            module.value,
+        )
+        merchant_hold = _merchant_row_grants_tier(row)
+        _module_cache.set(cache_key, merchant_hold)
 
-    tier = Tier.MERCHANT if _merchant_row_grants_tier(row) else Tier.PRO
-    _module_cache.set(cache_key, tier)
-    return tier
+    if merchant_hold:
+        return Tier.MERCHANT
+
+    return await get_user_tier(user_id, db)
 
 
 async def get_module_tier_via_rest(
@@ -408,20 +415,20 @@ async def get_module_tier_via_rest(
     For services in the same position get_subscription_state_via_rest
     already serves: Map Discovery, Booking Manager, Looks, Messaging and
     Signal all hold a Supabase project URL and a database that is not
-    Supabase. Map Discovery's own get_user_tier() is the precedent this
-    follows, one call for the platform tier and, only when that answers
-    PRO, one more for the module row.
+    Supabase. Same paid-time-stays-usable rule as get_module_tier above:
+    the module row is asked first, and an active hold answers MERCHANT
+    without the platform read at all, since is_pro() admits MERCHANT
+    through every at-least-Pro gate. The platform tier is only fetched
+    when the module row does not hold.
     """
-    platform_tier = await get_user_tier_via_rest(
-        user_id, supabase_url, service_role_key, timeout_seconds
-    )
-    if platform_tier != Tier.PRO:
-        return platform_tier
-
     cache_key = _module_cache_key(user_id, module)
-    cached = _module_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    merchant_hold = _module_cache.get(cache_key)
+    if merchant_hold is not None:
+        if merchant_hold:
+            return Tier.MERCHANT
+        return await get_user_tier_via_rest(
+            user_id, supabase_url, service_role_key, timeout_seconds
+        )
 
     import httpx
 
@@ -462,9 +469,15 @@ async def get_module_tier_via_rest(
             f"{response.text[:200]}"
         ) from exc
 
-    tier = Tier.MERCHANT if _merchant_row_grants_tier(rows[0] if rows else None) else Tier.PRO
-    _module_cache.set(cache_key, tier)
-    return tier
+    merchant_hold = _merchant_row_grants_tier(rows[0] if rows else None)
+    _module_cache.set(cache_key, merchant_hold)
+
+    if merchant_hold:
+        return Tier.MERCHANT
+
+    return await get_user_tier_via_rest(
+        user_id, supabase_url, service_role_key, timeout_seconds
+    )
 
 
 def is_pro(tier: Tier) -> bool:

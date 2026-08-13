@@ -1,14 +1,18 @@
 """
 Tests for get_module_tier / get_module_tier_via_rest.
 
-The property that matters most here is the short circuit: a member who
-isn't platform Pro must never trigger a merchant_subscriptions read at all,
-over either transport. That is not an optimisation, it is what makes "you
-cannot reach Merchant without Pro" true by construction rather than by
-convention. If the short circuit ever goes missing, a canceled Pro
-subscription sitting next to a stale active-looking merchant_subscriptions
-row would read as Merchant, which is the exact kind of two-tables-disagree
-bug this platform has paid for four times already.
+The property that matters most here is **paid time stays usable** (Henry,
+2026-08-13, v1.3.0): an active merchant_subscriptions row grants MERCHANT
+on its module even when the platform subscription has lapsed, because money
+already taken must never buy nothing. This inverts v1.2.0, whose
+load-bearing property was the opposite short circuit. The ladder is
+enforced where money changes hands instead: the checkout endpoint refuses
+Merchant to non-Pro members and the Stripe webhook stops Merchant renewals
+when Pro is cancelled, so an active-looking merchant row IS the truth this
+read should believe, and keeping that row truthful is the webhook's job.
+
+The module row is asked first and an active hold answers without the
+platform read at all; the platform tier is only consulted as the fallback.
 
 Run: pytest tests/test_module_tier.py
 """
@@ -114,13 +118,46 @@ def _ok(payload):
 
 
 @pytest.mark.asyncio
-async def test_free_platform_tier_short_circuits_before_the_module_query():
-    connection = _FakeConnection(subscription_row=None)
+async def test_lapsed_platform_with_active_merchant_row_is_merchant():
+    """
+    Paid time stays usable: the member who cancelled Pro halfway through a
+    paid Merchant year keeps that module until the paid period runs out.
+    The platform table is not even consulted when the module row holds.
+    """
+    connection = _FakeConnection(
+        subscription_row=None,
+        merchant_row={"status": "active"},
+    )
+
+    tier = await get_module_tier(USER, Module.STOREFRONT, connection)
+
+    assert tier is Tier.MERCHANT
+    assert connection.subscription_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_free_with_no_merchant_row_is_free():
+    connection = _FakeConnection(subscription_row=None, merchant_row=None)
 
     tier = await get_module_tier(USER, Module.STOREFRONT, connection)
 
     assert tier is Tier.FREE
-    assert connection.merchant_calls == 0
+    assert connection.merchant_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_lapsed_platform_with_a_canceled_merchant_row_is_free():
+    """
+    The paid period running out is exactly when this flips: a canceled
+    merchant row grants nothing, and with no platform subscription either
+    the member is FREE. Status decides, not row presence.
+    """
+    connection = _FakeConnection(
+        subscription_row=None,
+        merchant_row={"status": "canceled"},
+    )
+
+    assert await get_module_tier(USER, Module.STOREFRONT, connection) is Tier.FREE
 
 
 @pytest.mark.asyncio
@@ -234,11 +271,32 @@ async def test_invalidate_cache_clears_every_module_for_that_user():
 
 
 @pytest.mark.asyncio
-async def test_rest_free_platform_tier_never_requests_merchant_subscriptions(monkeypatch):
+async def test_rest_lapsed_platform_with_active_merchant_row_is_merchant(monkeypatch):
+    """
+    Paid time stays usable over REST too, and the platform table is not
+    even requested when the module row holds.
+    """
+    client = _patch_client(
+        monkeypatch,
+        subscriptions=_ok([]),  # must never be reached
+        merchant_subscriptions=_ok([{"status": "active"}]),
+    )
+
+    tier = await get_module_tier_via_rest(
+        USER, Module.STOREFRONT, SUPABASE_URL, SERVICE_KEY
+    )
+
+    assert tier is Tier.MERCHANT
+    urls = [r["url"] for r in client.requests]
+    assert urls == [f"{SUPABASE_URL}/rest/v1/merchant_subscriptions"]
+
+
+@pytest.mark.asyncio
+async def test_rest_free_with_no_merchant_row_is_free(monkeypatch):
     client = _patch_client(
         monkeypatch,
         subscriptions=_ok([]),
-        merchant_subscriptions=_ok([{"status": "active"}]),  # must never be reached
+        merchant_subscriptions=_ok([]),
     )
 
     tier = await get_module_tier_via_rest(
@@ -247,7 +305,10 @@ async def test_rest_free_platform_tier_never_requests_merchant_subscriptions(mon
 
     assert tier is Tier.FREE
     urls = [r["url"] for r in client.requests]
-    assert urls == [f"{SUPABASE_URL}/rest/v1/subscriptions"]
+    assert urls == [
+        f"{SUPABASE_URL}/rest/v1/merchant_subscriptions",
+        f"{SUPABASE_URL}/rest/v1/subscriptions",
+    ]
 
 
 @pytest.mark.asyncio
@@ -263,10 +324,13 @@ async def test_rest_pro_with_active_merchant_row_is_merchant(monkeypatch):
     )
 
     assert tier is Tier.MERCHANT
-    second_request = client.requests[1]
-    assert second_request["url"] == f"{SUPABASE_URL}/rest/v1/merchant_subscriptions"
-    assert second_request["params"]["user_id"] == f"eq.{USER}"
-    assert second_request["params"]["module"] == "eq.map_discovery"
+    # The module row is asked first now, and a hold answers alone: no
+    # platform request at all.
+    assert len(client.requests) == 1
+    first_request = client.requests[0]
+    assert first_request["url"] == f"{SUPABASE_URL}/rest/v1/merchant_subscriptions"
+    assert first_request["params"]["user_id"] == f"eq.{USER}"
+    assert first_request["params"]["module"] == "eq.map_discovery"
 
 
 @pytest.mark.asyncio
