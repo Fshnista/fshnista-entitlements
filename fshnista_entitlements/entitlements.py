@@ -71,6 +71,21 @@ import asyncpg
 class Tier(str, Enum):
     FREE = "free"
     PRO = "pro"
+    MERCHANT = "merchant"
+
+
+class Module(str, Enum):
+    """
+    The three modules Merchant is sold against, priced separately from one
+    another (Storefront and Booking Manager both 4.99/month, Map Discovery
+    3.99/month, Henry 2026-08-13). Matches the module CHECK constraint on
+    merchant_subscriptions and the source_service values already written
+    onto map_listings by Storefront and Booking Manager.
+    """
+
+    STOREFRONT = "storefront"
+    BOOKING_MANAGER = "booking_manager"
+    MAP_DISCOVERY = "map_discovery"
 
 
 # Statuses where the user keeps Pro access. Mirrors the same set used in the
@@ -88,34 +103,48 @@ class SubscriptionState:
 
 class _EntitlementCache:
     """
-    Tiny in-process TTL cache keyed by user_id. Not shared across processes
-    or instances, each service worker holds its own. That is fine, the cost
-    of a stale read for up to 60 seconds is negligible against the cost of
-    querying Postgres on every request.
+    Tiny in-process TTL cache keyed by an arbitrary string. Not shared across
+    processes or instances, each service worker holds its own. That is fine,
+    the cost of a stale read for up to 60 seconds is negligible against the
+    cost of querying Postgres on every request.
+
+    Generic over what it stores: the platform cache below keys by bare
+    user_id and holds a SubscriptionState, the module cache keys by
+    "user_id:module" and holds a bare Tier. Same shape, same TTL discipline,
+    deliberately not two hand-rolled copies of the same twelve lines.
     """
 
     def __init__(self, ttl_seconds: int = 60):
         self._ttl = ttl_seconds
-        self._store: dict[str, tuple[float, SubscriptionState]] = {}
+        self._store: dict[str, tuple[float, Any]] = {}
 
-    def get(self, user_id: str) -> Optional[SubscriptionState]:
-        entry = self._store.get(user_id)
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._store.get(key)
         if entry is None:
             return None
-        expires_at, state = entry
+        expires_at, value = entry
         if time.monotonic() > expires_at:
-            del self._store[user_id]
+            del self._store[key]
             return None
-        return state
+        return value
 
-    def set(self, user_id: str, state: SubscriptionState) -> None:
-        self._store[user_id] = (time.monotonic() + self._ttl, state)
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = (time.monotonic() + self._ttl, value)
 
-    def invalidate(self, user_id: str) -> None:
-        self._store.pop(user_id, None)
+    def invalidate(self, key: str) -> None:
+        self._store.pop(key, None)
 
 
 _cache = _EntitlementCache()
+# Keyed by "user_id:module", holds a bare Tier rather than a SubscriptionState:
+# a module tier is always derived (platform tier composed with a
+# merchant_subscriptions row), never a row read directly, so there is no
+# status or current_period_end of its own to carry.
+_module_cache = _EntitlementCache()
+
+
+def _module_cache_key(user_id: str, module: "Module") -> str:
+    return f"{user_id}:{module.value}"
 
 
 class EntitlementSourceUnavailable(Exception):
@@ -304,8 +333,153 @@ async def get_user_tier_via_rest(
     return state.tier
 
 
+def _merchant_row_grants_tier(row: Optional[Any]) -> bool:
+    """
+    True when a merchant_subscriptions row represents an active hold on that
+    module. Shares _PRO_GRANTING_STATUSES with the platform tier rather than
+    a second set: a failed card gets the same one-cycle grace period on a
+    Merchant module subscription as it does on Pro itself, and there is no
+    stated reason for those two grace periods to disagree.
+    """
+    return row is not None and row["status"] in _PRO_GRANTING_STATUSES
+
+
+async def get_module_tier(
+    user_id: str,
+    module: Module,
+    db: asyncpg.Connection,
+) -> Tier:
+    """
+    Returns the member's effective tier for ONE module: FREE, PRO, or
+    MERCHANT.
+
+    Composes two independent facts rather than reading one column, because
+    Merchant is held per module (merchant_subscriptions) while Pro is
+    platform-wide (subscriptions). A member can be Pro on the platform and
+    Merchant on Storefront alone, still capped at Pro's allowance on Booking
+    Manager and Map Discovery; get_user_tier() alone cannot express that,
+    since it takes no module and answers the same platform-wide tier
+    regardless of which module is asking.
+
+    Nobody reaches Merchant without first holding Pro: Merchant is priced
+    and sold as the step above Pro's included allowance, not a replacement
+    for it (see entitlement_rules.py's per-module caps), so a lapsed
+    platform subscription reads as FREE here even against an
+    active-looking merchant_subscriptions row. Reconciling that row is
+    Stripe's and the webhook handler's job, not this read's.
+
+    **Requires the caller's own connection to be Supabase.** Same
+    requirement as get_subscription_state: a service whose database is
+    somewhere else wants get_module_tier_via_rest instead.
+    """
+    platform_tier = await get_user_tier(user_id, db)
+    if platform_tier != Tier.PRO:
+        return platform_tier
+
+    cache_key = _module_cache_key(user_id, module)
+    cached = _module_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    row = await db.fetchrow(
+        """
+        SELECT status FROM merchant_subscriptions
+        WHERE user_id = $1 AND module = $2
+        """,
+        user_id,
+        module.value,
+    )
+
+    tier = Tier.MERCHANT if _merchant_row_grants_tier(row) else Tier.PRO
+    _module_cache.set(cache_key, tier)
+    return tier
+
+
+async def get_module_tier_via_rest(
+    user_id: str,
+    module: Module,
+    supabase_url: str,
+    service_role_key: str,
+    timeout_seconds: float = 5.0,
+) -> Tier:
+    """
+    Returns the member's effective tier for ONE module, read over PostgREST.
+
+    For services in the same position get_subscription_state_via_rest
+    already serves: Map Discovery, Booking Manager, Looks, Messaging and
+    Signal all hold a Supabase project URL and a database that is not
+    Supabase. Map Discovery's own get_user_tier() is the precedent this
+    follows, one call for the platform tier and, only when that answers
+    PRO, one more for the module row.
+    """
+    platform_tier = await get_user_tier_via_rest(
+        user_id, supabase_url, service_role_key, timeout_seconds
+    )
+    if platform_tier != Tier.PRO:
+        return platform_tier
+
+    cache_key = _module_cache_key(user_id, module)
+    cached = _module_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import httpx
+
+    endpoint = f"{supabase_url.rstrip('/')}/rest/v1/merchant_subscriptions"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            response = await client.get(
+                endpoint,
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "module": f"eq.{module.value}",
+                    "select": "status",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": service_role_key,
+                    "Authorization": f"Bearer {service_role_key}",
+                    "Accept": "application/json",
+                },
+            )
+    except Exception as exc:  # noqa: BLE001
+        raise EntitlementSourceUnavailable(
+            f"Could not reach the merchant_subscriptions table at {endpoint}: {exc}"
+        ) from exc
+
+    if response.status_code != 200:
+        raise EntitlementSourceUnavailable(
+            f"merchant_subscriptions read returned {response.status_code}: "
+            f"{response.text[:200]}"
+        )
+
+    try:
+        rows = response.json()
+    except ValueError as exc:
+        raise EntitlementSourceUnavailable(
+            f"merchant_subscriptions read returned a 200 that was not JSON: "
+            f"{response.text[:200]}"
+        ) from exc
+
+    tier = Tier.MERCHANT if _merchant_row_grants_tier(rows[0] if rows else None) else Tier.PRO
+    _module_cache.set(cache_key, tier)
+    return tier
+
+
 def is_pro(tier: Tier) -> bool:
-    return tier == Tier.PRO
+    """
+    True for PRO and MERCHANT both. Merchant is priced as the step above
+    Pro's allowance, not a separate track, so anything gated on "is this
+    member at least Pro" must also admit a Merchant member. Comparing
+    against Tier.PRO alone would silently lock a Merchant member, who is
+    paying more than a Pro one, out of whatever that gate protects.
+    """
+    return tier in (Tier.PRO, Tier.MERCHANT)
+
+
+def is_merchant(tier: Tier) -> bool:
+    return tier == Tier.MERCHANT
 
 
 def invalidate_cache(user_id: str) -> None:
@@ -313,5 +487,14 @@ def invalidate_cache(user_id: str) -> None:
     Call this after any flow that might have just changed a user's tier,
     e.g. immediately after a successful Checkout redirect, so the next
     request doesn't wait out the cache TTL on stale Free state.
+
+    Also clears every module's cached tier for this user. A platform tier
+    change can change what get_module_tier answers even when no
+    merchant_subscriptions row moved at all (a lapsed Pro member drops
+    every module to FREE regardless of what they hold), so a caller who
+    only knows "this user's subscription changed" does not have to also
+    know which modules to individually invalidate.
     """
     _cache.invalidate(user_id)
+    for module in Module:
+        _module_cache.invalidate(_module_cache_key(user_id, module))

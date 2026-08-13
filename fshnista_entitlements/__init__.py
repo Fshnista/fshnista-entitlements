@@ -10,19 +10,25 @@ See docs/ARCHITECTURE.md in this repo for the full system design.
 
 from .entitlements import (
     Tier,
+    Module,
     SubscriptionState,
     EntitlementSourceUnavailable,
     get_subscription_state,
     get_subscription_state_via_rest,
     get_user_tier,
     get_user_tier_via_rest,
+    get_module_tier,
+    get_module_tier_via_rest,
     is_pro,
+    is_merchant,
     invalidate_cache,
 )
 from .entitlement_rules import (
     EntitlementDecision,
-    BOOKING_MANAGER_FREE_MONTHLY_CAP,
+    BOOKING_MANAGER_PRO_MONTHLY_CAP,
+    STOREFRONT_PRO_LISTING_CAP,
     check_storefront_access,
+    check_storefront_listing_cap,
     check_booking_creation_access,
     check_booking_setup_access,
 )
@@ -30,17 +36,23 @@ from .entitlement_dependency import get_tier, require_pro
 
 __all__ = [
     "Tier",
+    "Module",
     "SubscriptionState",
     "EntitlementSourceUnavailable",
     "get_subscription_state",
     "get_subscription_state_via_rest",
     "get_user_tier",
     "get_user_tier_via_rest",
+    "get_module_tier",
+    "get_module_tier_via_rest",
     "is_pro",
+    "is_merchant",
     "invalidate_cache",
     "EntitlementDecision",
-    "BOOKING_MANAGER_FREE_MONTHLY_CAP",
+    "BOOKING_MANAGER_PRO_MONTHLY_CAP",
+    "STOREFRONT_PRO_LISTING_CAP",
     "check_storefront_access",
+    "check_storefront_listing_cap",
     "check_booking_creation_access",
     "check_booking_setup_access",
     "get_tier",
@@ -50,4 +62,4 @@ __all__ = [
 # Kept in step with pyproject.toml by hand. These two disagreed until
 # 1.1.0: this said 1.0.0 while the package built as 1.0.1, so anything
 # reading the version at runtime reported something that was never released.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
